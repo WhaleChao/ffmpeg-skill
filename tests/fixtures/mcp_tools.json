@@ -204,8 +204,10 @@
   "properties": [
    "argv",
    "aspect",
+   "compare",
    "content",
    "dry_run",
+   "expect_identity",
    "fast",
    "input",
    "json_brief",
@@ -333,6 +335,7 @@
    "plan",
    "preset",
    "quality",
+   "remove",
    "segments",
    "snap",
    "snap_source",
@@ -408,6 +411,7 @@
    "input",
    "json_brief",
    "list",
+   "max_mb",
    "no_hw",
    "no_scale",
    "normalize",
@@ -418,6 +422,7 @@
    "pad_fill",
    "plan",
    "preset",
+   "repair",
    "timeout"
   ],
   "required": []
@@ -599,6 +604,7 @@
    "argv",
    "channels",
    "codec",
+   "copy",
    "dry_run",
    "duration",
    "fast",

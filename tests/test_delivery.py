@@ -41,6 +41,68 @@ class DeliveryTests(MediaFixtures):
                 if preset in ("youtube", "reels", "x", "h265"):
                     self.assertEqual(m["video"]["color_space"], "bt709")
 
+    def test_export_max_mb_fits_the_size(self):
+        """2.24: --max-mb 1 on a 10 s clip that is several MB at the preset's CRF: two passes, the
+        written file under 1 MiB and measured; a budget too small for the picture, --crf with it,
+        and a non-x264 preset are refused before anything runs."""
+        src = OUT / "max_mb_src.mp4"
+        if not src.exists():
+            sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:d=10",
+               "-f", "lavfi", "-i", "sine=d=10", "-c:v", "libx264", "-crf", "5", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", src)
+        out = OUT / "max_mb_out.mp4"
+        doc = json.loads(script("export.py", src, "--preset", "youtube", "--max-mb", "1", "--no-scale", "-o", out,
+                                "--overwrite", "--json").stdout)
+        self.assertLessEqual(out.stat().st_size, 1024 * 1024)
+        size = next(v for v in doc["verification"] if v.get("step") == "file_size")
+        self.assertTrue(size["ok"] and size["measured"] == out.stat().st_size, size)
+        self.assertEqual(sum("-pass" in c for c in doc["commands"]), 2)
+        for extra, said in ((["--max-mb", "0.05"], "not watchable"), (["--max-mb", "1", "--crf", "20"], "give one of them"),
+                            (["--max-mb", "nan"], "positive number"), (["--max-mb", "inf"], "positive number")):
+            proc = script("export.py", src, "--preset", "youtube", *extra, "-o", OUT / "max_mb_bad.mp4", "--json", expect_fail=True)
+            self.assertIn(said, json.loads(proc.stdout)["error"]["message"])
+        proc = script("export.py", src, "--preset", "h265", "--max-mb", "1", "-o", OUT / "max_mb_bad.mp4", "--json", expect_fail=True)
+        self.assertIn("x264", json.loads(proc.stdout)["error"]["message"])
+
+    def test_export_repair_counts_damage_before_and_after(self):
+        """2.24: --preset copy --repair on a recording appended to itself: the input is untouched, the
+        counts are reported before and after, timestamp warnings do not grow, remaining decode errors
+        are named; --repair with a re-encoding preset is refused."""
+        lavfi = ["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:d=3", "-f", "lavfi", "-i", "sine=d=3"]
+        part = OUT / "repair_part.ts"
+        sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *lavfi,
+           "-c:v", "libx264", "-threads", "1", "-c:a", "aac", "-f", "mpegts", part)
+        if subprocess.run(["ffprobe", "-v", "error", "-show_format", str(part)], capture_output=True).returncode != 0:
+            # the johnvansickle static ffprobe builds (5.1.1, 7.0.2) segfault on any MPEG-TS file;
+            # MPEG-PS is the other container a recorder appends to, so the test still runs there
+            part = OUT / "repair_part.mpg"
+            sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *lavfi,
+               "-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpeg", part)
+        # the same recording appended to itself byte for byte, as a recorder that reconnected
+        # writes it: timestamps jump back (and in TS the continuity counters break)
+        src = OUT / ("repair_src" + part.suffix)
+        data = bytearray(part.read_bytes() * 2)
+        if part.suffix == ".mpg":
+            # 5.1.1 joins an appended program stream without a timestamp warning, so the PS copy
+            # also gets bytes flipped inside packs of the middle half (never a pack header): the
+            # MPEG-2 decoder names the damaged macroblocks in every version
+            packs = range(len(data) // 4 // 2048, 3 * len(data) // 4 // 2048)
+            for k in packs[::max(1, len(packs) // 20)]:
+                data[k * 2048 + 1024] ^= 0xFF
+        src.write_bytes(bytes(data))
+        before = src.read_bytes()
+        out = OUT / "repair_out.mp4"
+        doc = json.loads(script("export.py", src, "--preset", "copy", "--repair", "-o", out, "--overwrite", "--json").stdout)
+        self.assertEqual(src.read_bytes(), before)
+        rep = doc["repair"]
+        self.assertGreater(sum(rep["before"].values()), 0, rep)
+        self.assertLessEqual(rep["after"]["timestamp_warnings"], rep["before"]["timestamp_warnings"], rep)
+        step = next(v for v in doc["verification"] if v["step"] == "repair")
+        self.assertTrue(step["ok"] and step["measured"] == rep["after"]["timestamp_warnings"], step)
+        if rep["after"]["decode_errors"]:
+            self.assertIn("repair_incomplete", {w["code"] for w in doc["diagnostics"]["warnings"]}, doc.get("diagnostics"))
+        proc = script("export.py", src, "--preset", "youtube", "--repair", "-o", OUT / "repair_bad.mp4", "--json", expect_fail=True)
+        self.assertIn("--preset copy", json.loads(proc.stdout)["error"]["message"])
+
     def test_export_list(self):
         self.assertIn("youtube", script("export.py", "--list").stdout)
 

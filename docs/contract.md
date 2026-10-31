@@ -170,7 +170,7 @@ One entry per tool under `tools`, sorted by id. Tool ids are stable:
 | `verification` | `{required, tools}`: which tools to run on the output afterwards |
 | `requires_visual_verification` | the picture changed; run `ffmpeg-skill/look` and inspect the PNG |
 | `unverified_properties` | 2.18: the output properties this tool does not measure, the same list its results carry as `unverified` (empty when the tool names none) |
-| `reencodes_video`, `reencodes_audio` | `"always"` / `"never"` / `"conditional"`, meaning *when that stream is present in the input* — not whether the tool touches the file at all. `"conditional"` tools (`cut`, `export`, `render`, `batch`, `verify`, `caption`, `color`) carry a `reencode_note` explaining what it depends on — for `caption`, `--mode burn` (default) always re-encodes both streams, `--mode mux` copies both untouched; for `color`, `--strip-dovi` and `--retag` are a stream copy of both (retag only re-encodes if the copy attempt fails or ffprobe still reads the old tags on the copy), while `--to-sdr` / `--lut` / `--correct` always re-encode both. Several visual tools (`fit`, `overlay`, `graphics`, `join`, `multicam`, `silence`) are `"always"` on audio too: this codebase never mixes `-c:v` re-encode with `-c:a copy` in one call, so a caller cannot assume the original audio codec survives just because only the picture changed |
+| `reencodes_video`, `reencodes_audio` | `"always"` / `"never"` / `"conditional"`, meaning *when that stream is present in the input* — not whether the tool touches the file at all. `"conditional"` tools (`cut`, `export`, `render`, `batch`, `verify`, `caption`, `color`, `join`) carry a `reencode_note` explaining what it depends on — for `caption`, `--mode burn` (default) always re-encodes both streams, `--mode mux` copies both untouched; for `color`, `--strip-dovi` and `--retag` are a stream copy of both (retag only re-encodes if the copy attempt fails or ffprobe still reads the old tags on the copy), while `--to-sdr` / `--lut` / `--correct` always re-encode both; for `join`, `--copy --transition none` copies both, every other join re-encodes both. Several visual tools (`fit`, `overlay`, `graphics`, `multicam`, `silence`) are `"always"` on audio too: this codebase never mixes `-c:v` re-encode with `-c:a copy` in one call, so a caller cannot assume the original audio codec survives just because only the picture changed |
 | `audio_only` | accepts an audio-only input (WAV, MP3, M4A, FLAC, OGG, Opus) |
 | `video_required` | refuses an input without a video stream ("input has no video stream") |
 | | `render` has `audio_only: true` and `video_required: false` since 2.17.4: `--template podcast` and `--template audiogram` take an audio file. `join` has them since 0.9.1: audio-only inputs are joined as audio (no `look` needed then); mixing audio and video inputs is refused |
@@ -207,7 +207,9 @@ The `audio` row FAILs (WARN when no loudness target applies) when the track is p
 the loudness pass or, when loudness is skipped, one volumedetect pass). `check --content`
 (opt-in; render.py `"check": {"content": true}`) adds `black`, `frozen` and `silence` rows
 from one decode pass, `dropouts` (2.17) from one audio-only pass, and `flashes` and `first frame` (2.23) from one
-video-only pass and a one-frame decode; without it the row set is unchanged. Thresholds:
+video-only pass and a one-frame decode; without it the row set is unchanged.
+`--compare REF` adds `similarity` (SSIM/PSNR against a reference) and `--expect-identity SIZE:MTIME_NS`
+adds `identity`, against the `output_identity` every writing tool reports (2.24). Thresholds:
 `docs/design-decisions.md` ("check.py --content").
 
 ### Dry run
@@ -816,7 +818,7 @@ A refusal also carries `error.reason`, a stable snake_case code for *why*
 (`contract --json` → `json_output.error_reasons` lists them: `output_exists`, `output_is_input`,
 `output_is_directory`, `output_dir_missing`, `output_dir_not_writable`, `output_locked`,
 `media_path_is_url`, `media_path_is_playlist` (an HLS or ffconcat playlist given as media),
-`output_looks_like_option` (an output starting with `-`, other than `-` for stdout), `output_path_taken` (two files one run writes share a path), `media_path_not_a_file` (a FIFO or device as input), `silence.py --timemap`'s `timemap_path_taken`,
+`output_looks_like_option` (an output starting with `-`, other than `-` for stdout), `output_path_taken` (two files one run writes share a path), `media_path_not_a_file` (a FIFO or device as input), `silence.py --timemap`'s `timemap_path_taken`, `join.py --copy`'s `join_copy_mismatch`,
 `render.py`'s `plan_*` reasons, and `--codec av1`/`prores`'s `encoder_missing` and
 `encoder_list_unreadable`), and `error.details`, the facts the message is written from, so a
 caller never parses the prose:

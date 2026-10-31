@@ -31,12 +31,14 @@ Examples:
 import argparse
 import json
 import math
+import re
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List
 
-from _common import STATE, add_common, apply_common, bt709_matrix_args, bt709_tag_args, child_args, emit, cfr_args, default_output, die, encoder_args, ffmpeg_base, info, probe, require_tool, run, run_tool, validate_color, pad_filters, add_pad_fill_args, fmt_secs
+from _common import STATE, run_analysis, add_common, apply_common, bt709_matrix_args, bt709_tag_args, child_args, emit, cfr_args, default_output, die, encoder_args, ffmpeg_base, info, probe, require_tool, run, run_tool, validate_color, pad_filters, add_pad_fill_args, fmt_secs
 from _common.decision import hw_preset_video, restate_last_swap
 from _common.emit import note, record_fallback, record_skip, warn
 from check import SPECS as PLATFORMS, measure_loudness
@@ -239,6 +241,57 @@ def _non_av_report(subs: List[Dict], sub_codecs: List[str], data: List[Dict], dr
     return {"kept": kept, "dropped": gone}
 
 
+# --repair (2.24): regenerate missing timestamps, drop packets flagged corrupt, keep demuxing past errors
+REPAIR_INPUT_ARGS = ["-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err"]
+_TIMESTAMP_WARNING = re.compile(r"(?i)\b(dts|pts)\b|timestamp")
+
+
+def media_damage(path: str) -> Dict[str, int]:
+    """One full decode of `path` at -v warning: lines about timestamps (non-monotonic DTS, invalid
+    PTS) and every other error line, counted. What --repair is measured by, before and after."""
+    proc = run_analysis([require_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "warning", "-i", path, "-f", "null", "-"],
+                        check=False, record=True)
+    lines = [ln for ln in (proc.stderr or "").splitlines() if ln.strip()]
+    stamps = sum(1 for ln in lines if _TIMESTAMP_WARNING.search(ln))
+    return {"timestamp_warnings": stamps, "decode_errors": len(lines) - stamps}
+
+
+MIB = 1024 * 1024
+SIZE_HEADROOM = 0.97        # of the byte budget given to the streams; the rest is container overhead
+SIZE_MIN_VIDEO_KBPS = 100   # below this the picture is not worth delivering; refused instead
+
+
+def size_video_args(args, video: List[str], p: Dict, meta: Dict, has_audio: bool) -> List[str]:
+    """--max-mb: the preset's x264 line with its CRF replaced by the bitrate that fits the size,
+    for a two-pass encode. Refused where that cannot be done honestly: another codec, --crf, --hw,
+    a source with no duration, or a size too small for a watchable picture."""
+    if args.crf is not None:
+        die("--max-mb sets the bitrate from the size, --crf sets a quality: give one of them")
+    if "-c:v" not in video or video[video.index("-c:v") + 1] != "libx264" or "-crf" not in video:
+        die(f"--max-mb runs a two-pass x264 encode; --preset {args.preset} does not encode with x264"
+            + (" (--hw puts it on VideoToolbox, which has no two-pass mode)" if STATE.hw else ""))
+    if not math.isfinite(args.max_mb) or args.max_mb <= 0:
+        die(f"--max-mb must be a positive number of MiB, got {args.max_mb:g}")
+    dur = float(meta.get("duration") or 0.0)
+    if p["max"] and not args.allow_long:
+        dur = min(dur, float(p["max"]))
+    if dur <= 0:
+        die("--max-mb needs the source's duration, which it does not report")
+    audio_kbps = 0.0
+    if has_audio and "-b:a" in p["audio"]:
+        audio_kbps = float(p["audio"][p["audio"].index("-b:a") + 1].rstrip("k"))
+    video_kbps = args.max_mb * MIB * 8 * SIZE_HEADROOM / dur / 1000 - audio_kbps
+    if video_kbps < SIZE_MIN_VIDEO_KBPS:
+        die(f"--max-mb {args.max_mb:g} leaves {max(video_kbps, 0):.0f} kb/s for the picture over {dur:.1f}s "
+            f"(after {audio_kbps:.0f} kb/s of audio); under {SIZE_MIN_VIDEO_KBPS} kb/s it is not watchable",
+            hint="raise --max-mb, or cut the video shorter first")
+    out = list(video)
+    i = out.index("-crf")
+    out[i:i + 2] = ["-b:v", f"{video_kbps:.0f}k"]
+    info(f"--max-mb {args.max_mb:g}: {video_kbps:.0f} kb/s video + {audio_kbps:.0f} kb/s audio over {dur:.1f}s, two-pass")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", nargs="?")
@@ -250,6 +303,13 @@ def main() -> int:
     ap.add_argument("--no-scale", action="store_true", help="keep source resolution even for platform presets")
     ap.add_argument("--allow-long", action="store_true", help="do not trim to the platform's max duration")
     ap.add_argument("--crf", type=int, help="override CRF")
+    ap.add_argument("--repair", action="store_true",
+                    help="--preset copy only: remux a damaged file -- timestamps regenerated, corrupt packets dropped, "
+                         "negative timestamps shifted to zero -- and count the decode errors and timestamp warnings "
+                         "before and after; the input is never touched")
+    ap.add_argument("--max-mb", type=float, metavar="MB",
+                    help="fit the file under MB megabytes (MiB): a two-pass x264 encode at the video bitrate the "
+                         "running time leaves after the audio, measured afterwards (H.264 presets; not with --crf or --hw)")
     ap.add_argument("--normalize", action="store_true", help="youtube/youtube4k/reels/x: when the written file misses the platform's loudness spec, run loudness.py on it (audio re-encoded, video copied) so one export delivers")
     ap.add_argument("--list", action="store_true", help="list presets and exit")
     add_common(ap, codec=False)  # the preset decides the codec; --codec would only be refused
@@ -303,7 +363,9 @@ def main() -> int:
             vf.append("setsar=1")
         else:
             vf.append(f"scale={p['w']}:-2")
-    cmd = ffmpeg_base() + ["-i", args.input]
+    if args.repair and args.preset != "copy":
+        die("--repair is a remux: use it with --preset copy (a re-encoding preset already rebuilds every frame)")
+    cmd = ffmpeg_base() + (REPAIR_INPUT_ARGS if args.repair else []) + ["-i", args.input]
     # Subtitle and data streams (a soft-subtitle track muxed upstream, a camera's timecode) are
     # kept where the container can hold them: ffmpeg's default stream selection takes one video
     # and one audio stream only, and through 2.22.1 every preset dropped the rest without a word.
@@ -354,6 +416,8 @@ def main() -> int:
         # A build without libx264/libx265 has no other encoder, so it goes there without --hw too
         # (hw_preset_video returns the line untouched in every other case)
         video = hw_preset_video(video, meta, bt709=tag_bt709)
+    if args.max_mb is not None:
+        video = size_video_args(args, video, p, meta, has_audio)
     cmd += video
     if args.preset != "copy":
         # a stream copy can't be frame-rate-conformed or retagged without decoding it — that would
@@ -369,6 +433,8 @@ def main() -> int:
             cmd += bt709_matrix_args(meta)
     if out_ext == "mp4":
         cmd += ["-movflags", "+faststart"]
+    if args.repair:
+        cmd += ["-avoid_negative_ts", "make_zero"]
     cmd += (p["audio"] if has_audio else ["-an"])
     trimmed = None
     if p["max"] and not args.allow_long and (meta.get("duration") or 0) > p["max"]:
@@ -379,9 +445,16 @@ def main() -> int:
         note(f"trimmed from {trimmed['from']:.3f}s to the {args.preset} maximum of {p['max']:.0f}s "
              "(use --allow-long to keep full length)")
         cmd += ["-t", f"{p['max']:.3f}"]
-    dropped = _run_keeping_non_av(cmd, output, sub_codecs, len(data)) if (subs or data) else []
-    if not (subs or data):
-        run(cmd + [output])
+    damage_before = media_damage(args.input) if args.repair and not STATE.dry_run else None
+    with tempfile.TemporaryDirectory(prefix="ffskill_2pass_") as passdir:
+        if args.max_mb is not None:
+            # pass 1 only writes x264's statistics; pass 2 encodes against them
+            log = os.path.join(passdir, "x264")
+            run(cmd + ["-pass", "1", "-passlogfile", log, "-an", "-sn", "-dn", "-f", "null", "-"])
+            cmd += ["-pass", "2", "-passlogfile", log]
+        dropped = _run_keeping_non_av(cmd, output, sub_codecs, len(data)) if (subs or data) else []
+        if not (subs or data):
+            run(cmd + [output])
     result = probe(output, role="output")
     v = result["video"]
     info(f"wrote {output} ({fmt_secs(result['duration'])}, {v['width']}x{v['height']}, {v['codec']})")
@@ -463,6 +536,31 @@ def main() -> int:
             step = {"step": "duration", "property": "duration", "ok": False, "expected": {"max": p["max"]},
                     "reason": "not_measured: the written file reports no duration"}
         extra.setdefault("verification", []).append(step)
+    if damage_before is not None:
+        after = media_damage(output)
+        extra["repair"] = {"before": damage_before, "after": after}
+        # judged on timestamp warnings, the part a remux rewrites: decode errors are counted in log
+        # lines, and the same damaged frame logs a different number of them demuxed from another
+        # container, so their before/after is reported, not compared
+        stamps = after["timestamp_warnings"]
+        extra.setdefault("verification", []).append(
+            {"step": "repair", "property": "timestamp_warnings", "ok": stamps <= damage_before["timestamp_warnings"],
+             "expected": {"max": damage_before["timestamp_warnings"]}, "measured": stamps,
+             "provenance": "input_premeasurement"})
+        if after["decode_errors"]:
+            notes.append(f"--repair: {after['decode_errors']} decode error(s) remain: a remux drops corrupt packets and "
+                         "rewrites timestamps but cannot rebuild a damaged frame; a re-encoding preset decodes past them")
+            warn(notes[-1], "repair_incomplete", **after)
+    if args.max_mb is not None and not STATE.dry_run:
+        limit = int(args.max_mb * MIB)
+        size = os.path.getsize(output)
+        extra.setdefault("verification", []).append(
+            {"step": "file_size", "property": "size_bytes", "ok": size <= limit, "expected": {"max": limit},
+             "measured": size, "delta": size - limit, "tolerance": 0, "provenance": "user_specified"})
+        if size > limit:
+            notes.append(f"--max-mb {args.max_mb:g}: the file is {size / MIB:.2f} MiB, over the limit; the encoder overshot "
+                         f"its target bitrate on this content: export again with a lower --max-mb")
+            warn(notes[-1], "size_over_limit", size=size, limit=limit)
     # read back after --normalize, which rewrote the file
     non_av = _non_av_report(subs, sub_codecs, data, dropped, output, "write_failed")
     if non_av["dropped"]:

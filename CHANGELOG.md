@@ -4,7 +4,15 @@
 
 ## Unreleased
 
-(nothing yet)
+### Added
+
+- **`export.py --preset copy --repair` remuxes a damaged file** (a recording cut off mid-write, broken timestamps from a screen recorder): timestamps regenerated, corrupt packets dropped, negative timestamps shifted to zero, the input untouched. Decode errors and timestamp warnings are counted before and after; errors a remux cannot fix are named.
+- **`export.py --max-mb MB` fits a delivery under a size limit** (an email attachment, a chat app's upload cap): a two-pass x264 encode at the bitrate the running time leaves after the audio, with the written size measured. A size too small for a watchable picture (under 100 kb/s) is refused before anything runs.
+- **Every writing tool reports `output_identity: {size, mtime_ns}`, and `check.py --expect-identity SIZE:MTIME_NS` checks against it.** A check run after a write that failed, leaving an older file at the path, or after another run replaced it, used to grade whatever was there; with the flag an `identity` row FAILs instead. check.py reports the file it graded as `input_identity`. SKILL.md's delivery check passes it.
+- **`check.py --compare REF` measures the picture against a reference:** mean SSIM, the worst frame and its time, and mean PSNR, in one pass; WARN under a mean SSIM of 0.98. Frames of another size are not compared.
+- **`join.py --copy --transition none` joins clips by stream copy, without re-encoding,** when they already match: the same codec, size, frame rate, pixel format, colour tags, sample rate and channels in the first video and audio stream, no edit-list pre-roll, and picture and sound ending within 50 ms in each clip. Anything else is refused before ffmpeg runs, naming each clip and what differs (`reason: join_copy_mismatch`). The join is measured before it replaces anything: its video packet count must equal the clips' total and its length their summed length.
+- **`cut.py --remove A-B,...` drops ranges and keeps the rest,** the inverse of `--segments`: overlapping ranges merge, a leftover shorter than one frame is not kept, and a removal that leaves nothing is refused.
+- **SKILL.md routes the 2.24 features from plain requests:** "under 25 MB" → `export.py --max-mb`, "remove 1:00-1:30" → `cut.py --remove`, "join without re-encoding" → `join.py --copy --transition none`, "the recording is corrupted" → `export.py --preset copy --repair`, "how much quality was lost" → `check.py --compare`. The report format now sits above the routing table so it survives context compaction; two rows already covered elsewhere (`--dry-run`, VFR phone video) were dropped to stay under the 30 KB budget.
 
 ## 2.23.1
 
@@ -12,6 +20,7 @@ _Automated release: version and notes generated from pull requests merged since 
 
 ### Fixed
 
+- **`color.py --tonemap bt2390` is gone: it never worked.** FFmpeg's CPU `tonemap` filter has no BT.2390 curve in any version (only `tonemap_opencl` and libplacebo do), so choosing it always failed. The choices are now the filter's own curves (`hable`, `mobius`, `reinhard`, `clip`, `linear`, `gamma`), and a test checks them against the ffmpeg under test.
 - **`render.py --export-timeline` no longer expands XML entities when it reads an `.fcpxml` back.** The parse step used ElementTree, which expands entities declared in an internal DTD; on Python 3.9 and 3.10 a file of nested entities is an expansion bomb. The root element is now read with expat directly and a declared entity is refused (`timeline_parse_failed`, a `ParseError` naming the entity). The bare `<!DOCTYPE fcpxml>` the writer emits reads as before. Found by Snyk Code.
 - **SHA-1 is marked as not used for security** (`usedforsecurity=False`) where it keys caches (`batch.py`, `render.py`, the font copy in `drawtext`). The digests are unchanged, so existing caches still hit.
 - A `.snyk` policy file keeps `tests/`, `evals/` and `demos/` (never published) out of Snyk Code; `.github/` stays scanned.

@@ -827,3 +827,89 @@ def detect_scenes(path: str, threshold: float, min_len: float, duration: float, 
     if duration - cuts[-1] < min_len and len(cuts) > 1:
         cuts.pop()
     return cuts
+
+
+# What a stream-copy join compares (cut.py --segments, join.py --copy).
+IN_BAND_CONFIG = ("mp3", "mp2")
+TS_EXTS = (".ts", ".m2ts", ".mts")
+_SIG_FIELDS = {"video": ("codec_name", "profile", "pix_fmt", "width", "height", "r_frame_rate", "time_base",
+                         "sample_aspect_ratio", "color_space", "color_range", "color_transfer", "color_primaries"),
+               "audio": ("codec_name", "profile", "sample_rate", "channels", "time_base")}
+
+
+def stream_signature(doc: Dict[str, Any]) -> "List[Dict[str, Any]]":
+    """What a stream-copy join needs to be identical across parts, from one ffprobe document
+    (-show_streams with -show_data_hash sha256): each stream's type, codec parameters, rotation
+    and extradata hash. Shared by cut.py's --segments join and join.py --copy."""
+    sig = []
+    for st in doc.get("streams") or []:
+        kind = st.get("codec_type")
+        entry = {"type": kind, "extradata_hash": st.get("extradata_hash")}
+        entry.update({f: st.get(f) for f in _SIG_FIELDS.get(kind, ("codec_name",))})
+        if kind == "video":
+            entry["rotation"] = next((sd.get("rotation") for sd in st.get("side_data_list") or []
+                                      if "rotation" in sd), None)
+        sig.append(entry)
+    return sig
+
+
+def signatures_match(sigs: list, ext: str) -> bool:
+    """True when every part can be joined by stream copy: same streams in the same order with the
+    same parameters. A missing extradata hash only matches another missing one where the codec (or
+    an MPEG-TS output) carries its configuration in-band -- PCM has none at all."""
+    if not sigs or any(sig is None for sig in sigs):
+        return False
+    first = sigs[0]
+    for sig in sigs[1:]:
+        if len(sig) != len(first):
+            return False
+        for a, b in zip(first, sig):
+            if {k: v for k, v in a.items() if k != "extradata_hash"} != {k: v for k, v in b.items() if k != "extradata_hash"}:
+                return False
+            ha, hb = a.get("extradata_hash"), b.get("extradata_hash")
+            if ha or hb:
+                if ha != hb:
+                    return False
+            else:
+                codec = str(a.get("codec_name") or "")
+                if not (codec.startswith("pcm_") or codec in IN_BAND_CONFIG or ext in TS_EXTS):
+                    return False
+    return True
+
+
+# check.py --compare (2.24): the output's picture against a reference, frame by frame.
+COMPARE_SSIM_WARN = 0.98   # mean SSIM below this: a visible difference somewhere is likely
+_SSIM_SUMMARY = re.compile(r"SSIM Y:[0-9.]+ .*All:([0-9.]+)")
+_PSNR_SUMMARY = re.compile(r"PSNR y:\S+ .*average:(\S+)")
+_SSIM_FRAME = re.compile(r"n:(\d+) .*All:([0-9.]+)")
+
+
+def compare_pictures(path: str, reference: str) -> "Optional[Dict[str, Any]]":
+    """SSIM (mean and the worst frame) and PSNR (mean) of `path`'s first video stream against
+    `reference`'s, frame by frame in decode order, in one pass. ffmpeg's ssim and psnr filters
+    need equal sizes; the caller checks that first. None when the pass fails."""
+    import tempfile
+    from _common.decision import escape_filter_path
+    with tempfile.TemporaryDirectory(prefix="ffskill_compare_") as tmp:
+        stats = os.path.join(tmp, "ssim.log")
+        # frames paired by index (settb/setpts=N): ssim and psnr otherwise pair by timestamp, so a
+        # shifted or irregular timestamp would meet the wrong reference frame
+        graph = ("[0:V:0]settb=1/1000,setpts=N,split[a0][a1];[1:V:0]settb=1/1000,setpts=N,split[b0][b1];"
+                 f"[a0][b0]ssim=stats_file={escape_filter_path(stats, bind=False)};[a1][b1]psnr")
+        proc = run_analysis([require_tool("ffmpeg"), "-hide_banner", "-nostdin", "-i", path, "-i", reference,
+                             "-filter_complex", graph, "-f", "null", "-"], check=False, record=True)
+        if proc.returncode != 0:
+            return None
+        ssim, psnr = _SSIM_SUMMARY.search(proc.stderr), _PSNR_SUMMARY.search(proc.stderr)
+        frames = []
+        try:
+            with open(stats, encoding="utf-8") as fh:
+                frames = [(int(m.group(1)), float(m.group(2))) for m in map(_SSIM_FRAME.search, fh) if m]
+        except OSError:
+            pass
+    if not ssim or not frames:
+        return None
+    worst = min(frames, key=lambda f: f[1])
+    mean_psnr = psnr.group(1) if psnr else None
+    return {"ssim": float(ssim.group(1)), "worst_ssim": worst[1], "worst_frame": worst[0] - 1, "frames": len(frames),
+            "psnr": None if mean_psnr is None else (float("inf") if mean_psnr == "inf" else float(mean_psnr))}

@@ -408,6 +408,85 @@ class AnalysisTests(MediaFixtures):
             joined = " ".join(map(str, cmd))
             self.assertIn("0:V:0", joined, cmd)
             self.assertNotIn("0:v:0", joined, cmd)
+    def test_check_expect_identity_ties_the_check_to_one_write(self):
+        """2.24: a writing tool reports output_identity; check.py --expect-identity FAILs on any other
+        file at that path (here: the same path rewritten by a second run), and reports input_identity."""
+        src = self._content_clip("identity_src.mp4", "testsrc2=size=160x90:rate=10", "sine=frequency=440:sample_rate=48000", 2)
+        out = OUT / "identity_out.mp4"
+        first = json.loads(subprocess.run([sys.executable, str(SCRIPTS / "cut.py"), str(src), "--end", "1", "-o", str(out),
+                                           "--overwrite", "--json"], stdout=subprocess.PIPE, text=True).stdout)
+        ident = first["output_identity"]
+        self.assertEqual(ident["size"], out.stat().st_size)
+        expect = f"{ident['size']}:{ident['mtime_ns']}"
+        self.assertEqual(self._rows(out, "--no-loudness", "--expect-identity", expect)["identity"]["status"], "PASS")
+        subprocess.run([sys.executable, str(SCRIPTS / "cut.py"), str(src), "--end", "1.5", "-o", str(out), "--overwrite"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        proc = subprocess.run([sys.executable, str(SCRIPTS / "check.py"), str(out), "--platform", "custom", "--no-loudness",
+                               "--expect-identity", expect, "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        doc = json.loads(proc.stdout)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual({r["check"]: r["status"] for r in doc["checks"]}["identity"], "FAIL")
+        self.assertEqual(doc["input_identity"]["size"], out.stat().st_size)
+        # a file replaced while it was being measured fails, even when the second read matches
+        import contextlib, io
+        from unittest import mock
+        first = {"size": 1, "mtime_ns": 1}
+        now = {"size": out.stat().st_size, "mtime_ns": out.stat().st_mtime_ns}
+        argv = ["check.py", str(out), "--platform", "custom", "--no-loudness", "--expect-identity",
+                f"{now['size']}:{now['mtime_ns']}", "--json"]
+        buf = io.StringIO()
+        with mock.patch.object(check_module, "file_identity", side_effect=[first, now]), \
+                mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                check_module.main()
+        row = {r["check"]: r for r in json.loads(buf.getvalue())["checks"]}["identity"]
+        self.assertEqual((row["status"], row["reason"]), ("FAIL", "the file changed while it was being checked"), row)
+        # without --expect-identity there is no identity row, but the change is still a note
+        buf = io.StringIO()
+        with mock.patch.object(check_module, "file_identity", side_effect=[first, now]), \
+                mock.patch.object(sys, "argv", argv[:4] + ["--json"]), contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                check_module.main()
+            except SystemExit:
+                pass
+        doc = json.loads(buf.getvalue())
+        self.assertNotIn("identity", {r["check"] for r in doc["checks"]})
+        self.assertTrue(any("changed while it was being checked" in n for n in doc.get("notes", [])), doc.get("notes"))
+        # a dry run reads the file that exists, so the identity row is there under --dry-run too
+        self.assertEqual(self._rows(out, "--no-loudness", "--expect-identity", expect, "--dry-run")["identity"]["status"], "FAIL")
+
+    def test_check_compare_measures_against_a_reference(self):
+        """2.24: --compare REF: identical frames PASS as identical, a heavily compressed copy WARNs
+        under a mean SSIM of 0.98 with its worst frame, another frame size is not compared."""
+        ref = self._content_clip("compare_ref.mp4", "testsrc2=size=160x90:rate=10", "sine=frequency=440:sample_rate=48000", 3)
+        poor, small = OUT / "compare_poor.mp4", OUT / "compare_small.mp4"
+        sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ref, "-c:v", "libx264", "-crf", "45", "-c:a", "copy", poor)
+        sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ref, "-vf", "scale=80:46", "-c:v", "libx264", "-c:a", "copy", small)
+        same = self._rows(ref, "--no-loudness", "--compare", ref)["similarity"]
+        self.assertEqual(same["status"], "PASS")
+        self.assertIn("identical", same["value"])
+        low = self._rows(poor, "--no-loudness", "--compare", ref)["similarity"]
+        self.assertEqual(low["status"], "WARN", low)
+        self.assertIn("worst", low["value"])
+        self.assertIn("not compared", self._rows(small, "--no-loudness", "--compare", ref)["similarity"]["value"])
+
+    def test_check_compare_times_the_worst_frame_and_counts_frames(self):
+        """2.24: --compare names the worst frame by its presentation time (one damaged frame at
+        2.5 s), counts frames from the packets when the container states no nb_frames (an .mkv two
+        frames short of the reference), prints that note in plain text too, and keeps the row under
+        --dry-run when both files exist."""
+        ref = self._content_clip("compare_ref.mp4", "testsrc2=size=160x90:rate=10", "sine=frequency=440:sample_rate=48000", 3)
+        hit = OUT / "compare_one_bad_frame.mkv"
+        sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ref, "-t", "2.8",
+           "-vf", "drawbox=t=fill:color=white:enable='eq(n,25)'", "-c:v", "libx264", "-crf", "12", "-an", hit)
+        row = self._rows(hit, "--no-loudness", "--compare", ref)["similarity"]
+        self.assertIn("at 2.50s", row["value"], row)
+        proc = subprocess.run([sys.executable, str(SCRIPTS / "check.py"), str(hit), "--platform", "custom", "--no-loudness",
+                               "--compare", str(ref)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertIn("note: --compare: 28 frames against the reference's 30", proc.stdout + proc.stderr)
+        self.assertIn("similarity", self._rows(hit, "--no-loudness", "--compare", ref, "--dry-run"))
 
     def test_check_content_dropouts_row(self):
         """2.17: a short run of digital silence with sound on both sides (lost audio at a join) is a

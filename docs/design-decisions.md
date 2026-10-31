@@ -55,6 +55,10 @@ exists. When a decision changes, edit the entry in the same PR.
 - [2.21.1 — a stream that ends early or decodes nothing fails the check](#2211--a-stream-that-ends-early-or-decodes-nothing-fails-the-check)
 - [2.22 — silence.py says where it cut, and where to listen](#222--silencepy-says-where-it-cut-and-where-to-listen)
 - [2.23 — check.py --content's flashes and first-frame rows](#223--checkpy---contents-flashes-and-first-frame-rows)
+- [2.24 — join.py --copy and cut.py --remove](#224--joinpy---copy-and-cutpy---remove)
+- [2.24 — output identity and check.py --compare](#224--output-identity-and-checkpy---compare)
+- [2.24 — export.py --max-mb](#224--exportpy---max-mb)
+- [2.24 — export.py --repair](#224--exportpy---repair)
 <!-- contents:end -->
 
 ## Time limits
@@ -723,7 +727,10 @@ reachable with `--filler-extra`, which says what adding one costs. `なんか` i
 because it is the most common Japanese filler and leaving it out makes the flag useless for
 Japanese; it is orthographically identical to the pronoun use, so every run that removes one
 warns and `--filler-keep なんか` takes it back out. The asymmetry is deliberate: English has
-usable fillers without `like`, Japanese does not have usable fillers without `なんか`.
+usable fillers without `like`, Japanese does not have usable fillers without `なんか`. For the
+same reason Chinese `啊` is out of the `zh` list: it is a sentence-final particle far more often
+than a hesitation, so cutting it changes sentences; `--filler-extra 啊` adds it for a speaker who
+uses it as one.
 
 **There is no heuristic filler fallback without word timings.** "Remove the 0.3 s blips that look
 like an 'um'" would cut real speech — short words, breaths, the start of a sentence — and it
@@ -2341,3 +2348,89 @@ What was decided there:
   dark shot is still a picture. A fade from black is often the edit, so the row is a WARN whose
   fix starts with "a fade from black is a choice", for the destinations where autoplay or the
   preview shows frame 0. Code: `_common.probe.first_frame_stats()`. Same test.
+## 2.24 — join.py --copy and cut.py --remove
+
+- **`--copy` is opt-in, and a mismatch is refused rather than re-encoded.** A join that
+  re-encoded by default and copied when it could would change what an existing call does, which
+  the stability promise allows only for a defect; and a caller who asked for a copy and got a
+  re-encode would learn it only from `mode`. So `--copy` either copies or refuses, naming each
+  clip that differs and how. The comparison is cut.py's `--segments` one
+  (`_common.probe.stream_signature()` / `signatures_match()`, moved there so both use it), on
+  the first video and the first audio stream, which are the streams the join maps. Test:
+  `test_join_copy_joins_matching_clips_and_refuses_a_mismatch`.
+- **What a matching signature does not catch is checked too.** An MP4 edit list that
+  hides pre-roll frames (packets flagged discard in the first 300): the concat demuxer ignores
+  edit lists, so a copy join would show them. Picture and sound that end more than 50 ms apart
+  at either end of a clip (each stream's start, and its start plus its length): the demuxer starts the next clip where this one's container ends, so the shorter
+  stream leaves a held frame or a hole in the sound there. And the result itself: its video
+  packet count against the clips' total, and its video length against their summed length
+  (within 50 ms per clip plus a frame), measured on a file beside the output that is renamed
+  into place only when both hold. Same test.
+- **Clips must lay out their streams alike.** The concat demuxer maps each clip's packets by
+  stream index into the first clip's layout, so a cover picture stored between the video and the
+  sound in one clip would put that clip's sound on another stream. A different stream count or
+  order is refused before the signatures are compared. Same test.
+- **`cut.py --remove` is `--segments` written the other way.** It builds the keep list and
+  hands it to the same code, so a removal is cut, joined, declicked and verified exactly as the
+  equivalent `--segments` would be. Overlaps merge and the ranges are clamped to the file; a
+  leftover shorter than one frame (10 ms without a frame rate) is not a piece anyone asked to
+  keep. A range may start before 0 (it is clamped like the end). `--snap beats` is refused with
+  it: a snapped edge of what is kept could move into a range the caller asked to drop, and the
+  flag's promise is that those ranges are gone. Test: `test_cut_remove_keeps_the_rest`.
+
+## 2.24 — output identity and check.py --compare
+
+- **An output is identified by size and modification time, not a hash.** The point is to tell
+  the file a run wrote from whatever sits at the path later (an older file a failed `--overwrite`
+  run left, a file another run replaced). Size plus `mtime_ns` changes on any rewrite and costs
+  one `stat`; a sha256 of an hour-long master costs seconds and proves nothing more for that
+  purpose. Code: `_common.emit.file_identity()`. Test:
+  `test_check_expect_identity_ties_the_check_to_one_write`.
+- **`--expect-identity` is a FAIL, not a WARN.** The row exists for the case where the file is
+  not the one the caller believes it is checking; passing the other rows on that file would be
+  the false success the flag is there to stop. Without the flag check.py grades the path as
+  before and only reports `input_identity`. Same test.
+- **`--compare` pairs frames in decode order and reports, it does not align.** SSIM and PSNR are
+  ffmpeg's own filters in one pass. Those filters pair by timestamp, so both pictures are re-timed
+  to their frame index first (`setpts=N`): a shifted or irregular timestamp cannot meet the wrong
+  reference frame. A dropped or added frame shifts every later pair, so a different frame count
+  (from `nb_frames`, or counted from the packets when a container does not state it) is named in
+  `notes` rather than hidden. Frames of another size are not compared at all (WARN, "not compared"): scaling one of
+  them first would measure the scaler. The WARN line is a mean SSIM of 0.98, where differences
+  start to be visible on ordinary footage; the worst frame and its time say where to look
+  (`look.py --compare`), the time read as the flashes row reads it (that frame's presentation
+  time, `~` index / rate without one). Cover art is not the picture compared (`V`, not `v`). Code: `_common.probe.compare_pictures()`. Test:
+  `test_check_compare_measures_against_a_reference`.
+
+## 2.24 — export.py --max-mb
+
+- **A size limit is a two-pass x264 encode at a computed bitrate, then measured.** The budget is
+  97% of MB MiB (the rest is the container's overhead), less the preset's own audio bitrate, over
+  the running time the export keeps (the preset's maximum when it trims). One pass at that bitrate
+  misses on content whose complexity changes; two passes are what x264 offers for a size. The
+  size is still measured, because x264's rate control is a target, not a bound: an overshoot is a
+  `file_size` verification failure and a `size_over_limit` warning, not a silent pass. Test:
+  `test_export_max_mb_fits_the_size`.
+- **What it cannot do honestly is refused.** Another encoder (the HEVC, AV1, ProRes, GIF and copy
+  presets; VideoToolbox under `--hw`, which has no two-pass mode), `--crf` (a quality, not a
+  size), a source with no duration, and a budget that leaves under 100 kb/s for the picture. A
+  size that small makes an unwatchable file the user did not ask for, so the refusal says the
+  bitrate it would have been. Same test.
+
+## 2.24 — export.py --repair
+
+- **Repair is a flag on the copy preset, not a tool.** It is a remux with three input flags
+  (`-fflags +genpts+discardcorrupt -err_detect ignore_err`) and `-avoid_negative_ts make_zero`:
+  the copy preset with different demuxing, so a new tool would add a name without adding a job.
+  A re-encoding preset already decodes past damage, so `--repair` with one is refused as
+  meaningless. Test: `test_export_repair_counts_damage_before_and_after`.
+- **It is measured by what a decoder says, before and after.** One full decode of each file at
+  `-v warning`, lines about timestamps counted apart from the rest. The verification step is
+  judged on timestamp warnings only, the part a remux rewrites, and fails when the output has more
+  than the input. Decode errors are reported before and after but not compared: they are log
+  lines, and the same damaged frame logs a different number of them demuxed from TS than from MP4
+  (one run of this test logged 51 before and 53 after on a remux that dropped nothing it should
+  have kept). Errors that remain are named (`repair_incomplete`) with the way out (a re-encoding
+  preset). On a TS file with 40 bytes of video payload overwritten (never a TS header or table, so
+  every ffmpeg version still opens it): 99 decode-error lines before, 100 after, no timestamp
+  warnings either side. Same test.

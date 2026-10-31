@@ -4,11 +4,18 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.23.1
+
+_Automated release: version and notes generated from pull requests merged since 2.23.0._
+
 ### Fixed
 
 - **`render.py --export-timeline` no longer expands XML entities when it reads an `.fcpxml` back.** The parse step used ElementTree, which expands entities declared in an internal DTD; on Python 3.9 and 3.10 a file of nested entities is an expansion bomb. The root element is now read with expat directly and a declared entity is refused (`timeline_parse_failed`, a `ParseError` naming the entity). The bare `<!DOCTYPE fcpxml>` the writer emits reads as before. Found by Snyk Code.
 - **SHA-1 is marked as not used for security** (`usedforsecurity=False`) where it keys caches (`batch.py`, `render.py`, the font copy in `drawtext`). The digests are unchanged, so existing caches still hit.
 - A `.snyk` policy file keeps `tests/`, `evals/` and `demos/` (never published) out of Snyk Code; `.github/` stays scanned.
+- fix(security): read fcpxml without entity expansion; mark cache SHA-1 as non-security (#384)
 
 ## 2.23.0
 

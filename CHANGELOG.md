@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.24.1
+
+_Automated release: version and notes generated from pull requests merged since 2.24.0._
+
 ### Fixed
 
 - **`check.py --compare` measured frames that do not exist.** A shorter output's last frame was repeated against the rest of the reference (a mean SSIM of 0.90 for 52 identical frames, the worst frame timed past the file's end); only the frames both files have are compared now, and the note says how many. An RGB file gave "could not measure" or a value that depended on argument order, and a phone clip stored sideways was compared by its stored size; both are handled.
@@ -13,6 +19,7 @@
 - **`export.py --preset gif --max-mb`** ignored the limit and reported `verified: true`; refused. A `--max-mb` so large it constrains nothing is refused as input instead of failing in libx264.
 - **`export.py --repair` miscounted damage:** "Packet corrupt (… dts = …)" counted as a timestamp warning and "Last message repeated N times" as a decode error, so a remux that made timestamps worse could pass. Every occurrence is printed and classified.
 - **`render.py --stop-after` (before the export) without `--work`** deleted the work directory at exit, and with it the file the result named; the directory is kept.
+- Fix the false claims found reviewing 2.24.0 (compare, copy join, max-mb, repair, stop-after) (#386)
 
 ## 2.24.0
 

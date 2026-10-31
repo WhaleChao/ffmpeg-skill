@@ -39,6 +39,29 @@ class AnalysisTests(MediaFixtures):
         compact = script("probe.py", self.src, "--compact").stdout
         self.assertIn("1280x720", compact)
 
+    def test_probe_reports_the_start_timecode(self):
+        """probe's `timecode` (nle-bridge's source timecode): the first well-formed `timecode` tag
+        from the video stream, a tmcd data stream, then the container; `drop_frame` is the `;`."""
+        cases = [("tc.mov", "25", "01:00:00:00", False), ("tc.mp4", "25", "01:00:00:00", False),
+                 ("tc_df.mov", "30000/1001", "01:00:00;00", True)]
+        for name, rate, tc, drop in cases:
+            out = OUT / name
+            sh("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=d=1:s=160x90:r={rate}", "-timecode", tc, out)
+            data = json.loads(script("probe.py", out, "--json").stdout)
+            self.assertEqual(data["timecode"]["value"], tc, name)
+            self.assertIs(data["timecode"]["drop_frame"], drop, name)
+            self.assertRegex(data["timecode"]["source"], r"^(stream:\d+|format)$", name)
+        data = json.loads(script("probe.py", self.src, "--json").stdout)
+        self.assertEqual(data["timecode"], {"value": None, "drop_frame": None, "source": None})
+        pick = content_probe.start_timecode
+        tmcd = {"index": 2, "codec_type": "data", "codec_tag_string": "tmcd", "tags": {"timecode": "10:00:00:00"}}
+        self.assertEqual(pick([tmcd], {"tags": {"timecode": "00:00:00:00"}}, {"index": 0}),
+                         {"value": "10:00:00:00", "drop_frame": False, "source": "stream:2"})
+        self.assertEqual(pick([], {"tags": {"TIMECODE": "01:00:00.00"}}, {"index": 0, "tags": {"timecode": "not a tc"}}),
+                         {"value": "01:00:00.00", "drop_frame": True, "source": "format"}, "a malformed tag is skipped")
+        self.assertEqual(pick([], {"tags": {"timecode": "02:00:00:00"}}, {"index": 0, "tags": {"timecode": "01:99:99:00"}})["source"],
+                         "format", "minutes and seconds above 59 are not a timecode")
+
     def test_probe_accepts_common_flags(self):
         out = script("probe.py", self.src, "--json", "--field", "duration").stdout.strip()
         self.assertClose(float(out), 12.0, 0.1)
@@ -497,11 +520,7 @@ class AnalysisTests(MediaFixtures):
         short, rgb, side, upright = (OUT / n for n in ("compare_short.mp4", "compare_rgb.mkv", "compare_side.mp4", "compare_upright.mp4"))
         sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ref, "-t", "1.5", "-c", "copy", short)
         sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ref, "-c:v", "libx264rgb", "-crf", "0", "-an", rgb)
-        # -display_rotation is FFmpeg 6.0+; 5.x writes the same display matrix from the rotate tag
-        rotated = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-display_rotation", "90", "-i", str(ref),
-                                  "-c", "copy", str(side)], capture_output=True)
-        if rotated.returncode != 0:
-            sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", ref, "-c", "copy", "-metadata:s:v:0", "rotate=90", side)
+        sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-display_rotation", "90", "-i", ref, "-c", "copy", side)
         self.assertIn(abs(int(probe(str(side))["video"].get("rotation") or 0)), (90, 270))
         sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", side, "-c:v", "libx264", "-crf", "0", "-an", upright)
         row = self._rows(short, "--no-loudness", "--compare", ref)["similarity"]

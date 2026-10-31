@@ -22,6 +22,7 @@ exists. When a decision changes, edit the entry in the same PR.
 **By release, review or plan** (in the order they were added):
 
 - [Decided for 2.0 (issue #189 B), recorded in 1.x so the code moved toward them](#decided-for-20-issue-189-b-recorded-in-1x-so-the-code-moved-toward-them)
+- [3.0.0 — the floors rise, and the cut defaults decided for 3.0 apply](#300--the-floors-rise-and-the-cut-defaults-decided-for-30-apply)
 - [External review, 2026-09-14 (1.17.0)](#external-review-2026-09-14-1170)
 - [External review, 2026-09-13](#external-review-2026-09-13)
 - [1.15.0 — text people can see](#1150--text-people-can-see)
@@ -459,6 +460,47 @@ exists. When a decision changes, edit the entry in the same PR.
   in-process: thread `ctx` through the three choke points (a signature change, hence a major);
   tools that only call those keep working with a one-line change. Rejected: thread-locals (hides
   the dependency the reviews keep asking about). Code: `_common.Context`.
+
+## 3.0.0 — the floors rise, and the cut defaults decided for 3.0 apply
+
+- **Python 3.10 and FFmpeg 6.1 are the floors (`requirements.python` `>=3.10 (standard library
+  only)`, `requirements.ffmpeg`/`ffprobe` `>=6.1`).** The two 2.x deprecations (Python 3.9 in
+  2.10.9, FFmpeg 5.x in 2.14.0, both below) moved from `contract --json`'s `deprecated` to
+  `removed`, so `deprecated` is empty again. CI's Python floor is 3.10 (plus 3.13), and the 5.1.1
+  static job is gone: CI runs 6.1 (Ubuntu 24.04 apt), 7.1 (Debian trixie), 8.x (macOS Homebrew),
+  9.x (Windows gyan.dev) and 8.0.1 (Ubuntu 26.04 apt). The 90-day half of the deprecation
+  window was waived in writing (`docs/contract.md`, "Deprecation policy"). Code:
+  `_contract.REMOVED`, `_contract.MIN_PYTHON`/`MIN_FFMPEG`, `bin/install.js`'s `PYTHON_PROBE`.
+  Test: `test_3_0_removed_python_3_9_and_ffmpeg_5_on_every_surface`.
+- **An FFmpeg older than 6.1 is refused, not warned about.** 2.x kept the 5.x and 6.0 code paths
+  (drawtext's single-value `boxborderw`, among others) and printed a warning; 3.0.0 deleted those
+  paths, so an old build would no longer fail cleanly here -- it would fail later in some other,
+  worse way (a filter option it rejects halfway through a render). Every tool's first
+  `ffmpeg`/`ffprobe` lookup therefore refuses a version it can read as older than 6.1, with
+  `kind: missing_tool` (exit 127), `error.reason: ffmpeg_unsupported` and `details: {version,
+  required}`; `doctor` lists the line in `unsupported` and reports `ok: false`, and the `npx`
+  installer prints the same line. A git or vendor build whose version is not a release number
+  (`N-12345-g…`) is **not** refused: its age cannot be read, the same rule as the security
+  advisory, and refusing it would lock out exactly the newest builds. Code:
+  `runner.require_tool()`, `_contract.ffmpeg_unsupported()`, `_contract.doctor()`. Tests:
+  `test_every_tool_refuses_an_ffmpeg_older_than_6_1`,
+  `test_doctor_reports_an_unsupported_python_or_ffmpeg_and_fails`.
+- **A Python older than 3.10 is not refused by the tools themselves, only reported.** The
+  installer skips such an interpreter (and warns when it finds none), and `doctor` lists it in
+  `unsupported` with `ok: false`; the scripts do not check their own interpreter version.
+  Code: `bin/install.js` `findPython()`/`warnMissingPython()`, `_contract.python_unsupported()`.
+- **The "Decided for 3.0" defaults now apply (2.8.0 section below).** `cut.py` keeps the edit list
+  on a single `.mp4`/`.mov` stream copy (`--no-edit-list` restores `-avoid_negative_ts make_zero`);
+  an SDR HEVC source's re-encode stays HEVC, x265 8-bit BT.709 (`--no-keep-hevc` restores x264);
+  `--vfr-guard` defaults to `sampled` (`--vfr-guard average` restores 2.x). `--edit-list` and
+  `--keep-hevc` are still accepted, so a 2.x command line runs unchanged. `precision` is the least
+  exact segment's (equal to `least_exact_precision`, which stays) and `keyframe_snapped` equals
+  `start_snapped`; `contract_version` is `2.0`. Code: `cut.main()` (the `--no-` flags and
+  `KEEP_HEVC`), `cut.report_precision()`. Tests: the cut-copy tests in `tests/test_cut_copy.py`
+  that pin a default `.mp4` copy keeping its edit list, an SDR HEVC re-encode staying HEVC
+  (`test_sdr_hevc_is_encoded_as_hevc_8bit_bt709`, `test_a_reencoded_cut_of_an_sdr_hevc_source_stays_hevc`)
+  and the sampled VFR guard by default, and the precision tests in `tests/test_editing.py` that pin
+  `precision` as the least exact segment's and `keyframe_snapped` as `start_snapped`.
 
 ## External review, 2026-09-14 (1.17.0)
 
@@ -1347,7 +1389,7 @@ not a new file format this tool would have to maintain.
   not in a changed request. Tests (main's, restored verbatim):
   `test_cut_json_reports_requested_vs_actual_and_mode`,
   `test_cut_copy_keyframe_snap_reports_a_real_nonzero_delta`, `test_eval6_followups`; new:
-  `test_cut_precision_keeps_its_formula_and_least_exact_precision_is_beside_it`,
+  `test_cut_precision_is_the_least_exact_segments_and_keyframe_snapped_is_start_snapped` (renamed in 3.0.0),
   `test_cut_start_snapped_is_measured_and_null_under_dry_run`,
   `test_a_sound_tail_under_a_frame_ends_the_segment_with_its_picture`.
 - **A join that re-encoded is not reported as a copy (defect fix, on by default).** When the
@@ -1544,7 +1586,7 @@ not a new file format this tool would have to maintain.
   the HEVC fixture) is a snap. Comparing the output's durations with and without the edit list
   was tried and does not work: a B-frame composition offset makes them differ even on a keyframe
   start. Code: `cut.seek_keyframe`, `cut.copy_presentation`. Tests:
-  `test_an_mp4_copy_shifts_to_zero_unless_the_edit_list_is_asked_for` (the default),
+  `test_an_mp4_copy_keeps_its_edit_list_by_default_and_shifts_to_zero_under_no_edit_list` (renamed in 3.0.0, when the edit list became the default),
   `test_an_mp4_copy_starts_its_picture_at_the_requested_time`,
   `test_an_edit_listed_source_cut_again_starts_where_asked`,
   `test_judging_a_copy_by_its_video_is_noted_even_when_it_then_reencodes`; main's
@@ -1600,7 +1642,7 @@ not a new file format this tool would have to maintain.
   re-encode gets no note: it starts both streams where the source has them (the re-cut pads the
   audio to each segment's origin), and the note told `--accurate` runs to re-run with
   `--accurate`. Code: `cut.av_skew`, `cut.source_skew`. Tests:
-  `test_an_mp4_copy_shifts_to_zero_unless_the_edit_list_is_asked_for`,
+  `test_an_mp4_copy_keeps_its_edit_list_by_default_and_shifts_to_zero_under_no_edit_list`,
   `test_a_source_whose_audio_starts_late_is_not_reported_as_a_skewed_cut`,
   `test_a_snapped_copy_is_compared_with_the_source_where_it_landed`,
   `test_a_reencode_never_carries_the_copy_skew_note`,
@@ -1616,8 +1658,8 @@ not a new file format this tool would have to maintain.
   source gets the same Main10 line either way, and `--codec` always wins. The contract's `cut`
   capabilities keep 2.5.1's x264 and HDR x265 entries, the x265 one extended by "with
   `--keep-hevc` on an HEVC source". Tests:
-  `test_a_reencoded_cut_of_an_sdr_hevc_source_is_h264_unless_keep_hevc_is_asked_for` (the default
-  pin), `test_a_reencoded_cut_of_an_sdr_hevc_source_stays_hevc`,
+  `test_a_reencoded_cut_of_an_sdr_hevc_source_stays_hevc_unless_no_keep_hevc` (the default
+  pin, inverted in 3.0.0), `test_a_reencoded_cut_of_an_sdr_hevc_source_stays_hevc`,
   `test_codec_h264_still_overrides_the_source_codec`, `SourceCodecArgsTests` (including
   `test_cut_passes_keep_hevc_to_the_encoder_and_composes_with_hw`).
 - **A chunked join restates `hvc1`, by default.** A `--segments` re-cut of more than 32 segments
@@ -1653,8 +1695,9 @@ not a new file format this tool would have to maintain.
   edit-listed MP4 skipped its negative-pts keyframe). Code: `cut.main()` (the guard),
   `_common/probe.py` `classify_frame_timing`, `measure_frame_timing`. Tests:
   `test_vfr_is_conformed_to_cfr_on_cut_and_fit` (2.5.1's, verbatim),
-  `test_a_short_constant_clip_copies_by_default`,
-  `test_a_suspected_but_constant_source_reencodes_by_default_and_says_sampled_would_copy`,
+  `test_a_short_constant_clip_copies_under_average` (`--vfr-guard average` since 3.0.0),
+  `test_a_suspected_but_constant_source_reencodes_under_average_and_says_sampled_would_copy`,
+  `test_the_default_guard_is_sampled`,
   `FrameTimingTests`, `VfrGuardTests` (`--vfr-guard sampled` / `off`).
 - **A segment past the video's end is held or trimmed, like a join.py clip; `--accurate` joins in one
   encode.** Both concat routes start the next segment after the longer stream of this one, so a
@@ -1674,7 +1717,7 @@ not a new file format this tool would have to maintain.
   source stays HEVC; `--vfr-guard sampled` becomes the default, so a stream copy is refused on
   measured frame timing rather than on the whole-file average; `keyframe_snapped` takes
   `start_snapped`'s meaning (the presented start moved) and `precision` takes
-  `least_exact_precision`'s (the least exact segment).
+  `least_exact_precision`'s (the least exact segment). 3.0.0 applied all five (see "3.0.0 — the floors rise" above).
 
 ## 2.10.7 — geometry uses the displayed frame
 
@@ -1822,8 +1865,9 @@ not a new file format this tool would have to maintain.
   Every deprecation warning has been a stderr line (`--crf` in 1.10), and the machine-readable
   form is `contract --json`'s `deprecated`. The FFmpeg advisory is about the machine, which is what
   `doctor --json` describes, so it has a key (`ffmpeg_security.warnings`). The 3.9 floor and CI's
-  3.9 job stay until 3.0. Tests: `test_python_3_9_is_deprecated_on_every_surface`,
-  `test_doctor_prints_the_python_3_9_warning_on_stderr_only`, `test_installer_warns_once_on_python_3_9`.
+  3.9 job stay until 3.0. 3.0.0 removed the support and these tests; the refusal is pinned by
+  `test_3_0_removed_python_3_9_and_ffmpeg_5_on_every_surface` and
+  `test_doctor_reports_an_unsupported_python_or_ffmpeg_and_fails`.
 
 ## 2.11.0–2.12.0 — nothing happens silently
 
@@ -2089,8 +2133,9 @@ What was decided there:
   workarounds stay. It follows the Python 3.9 route above: an entry in `contract --json`'s
   `deprecated`, and one stderr line from `doctor` and the `npx` installer when `ffmpeg -version`
   reads 5.x, never a key in `doctor --json` and never a failure. A git snapshot's version is not a
-  release number and gets no line, the same rule as the security advisory. Tests:
-  `test_ffmpeg_5_is_deprecated_on_every_surface`, `test_doctor_prints_the_ffmpeg_5_warning_on_stderr_only`.
+  release number and gets no line, the same rule as the security advisory. 3.0.0 removed
+  the support and these tests; the refusal is pinned by `test_3_0_removed_python_3_9_and_ffmpeg_5_on_every_surface`
+  and `test_every_tool_refuses_an_ffmpeg_older_than_6_1`.
 
 ## 2.15.0 — render.py's intermediate stages encode with veryfast
 

@@ -105,6 +105,7 @@ ERROR_RETRYABLE = False
 
 
 _FFMPEG_VERSION: "Optional[Tuple[int, int]]" = None
+_FFMPEG_VERSION_IS_RELEASE = False   # ffmpeg_version() read a release number, not the libavutil major
 
 
 def ffmpeg_version() -> "Tuple[int, int]":
@@ -114,7 +115,7 @@ def ffmpeg_version() -> "Tuple[int, int]":
     ship from the same build. Used only to pick between two spellings of an option where FFmpeg
     changed behaviour between releases (the tools otherwise never branch on the version: doctor's
     capability listing is the source of truth for what a build can do)."""
-    global _FFMPEG_VERSION
+    global _FFMPEG_VERSION, _FFMPEG_VERSION_IS_RELEASE
     if _FFMPEG_VERSION is None:
         _FFMPEG_VERSION = (0, 0)
         try:
@@ -123,6 +124,7 @@ def ffmpeg_version() -> "Tuple[int, int]":
             m = re.search(r"ffprobe version\s+n?(\d+)\.(\d+)", out)
             if m:
                 _FFMPEG_VERSION = (int(m.group(1)), int(m.group(2)))
+                _FFMPEG_VERSION_IS_RELEASE = True
             else:
                 # git / vendor builds print "N-115000-g..." or a date, never major.minor; the
                 # libavutil major is still there and maps one-to-one onto the FFmpeg major
@@ -271,6 +273,21 @@ def found_exe(name: str) -> str:
 def require_tool(name: str) -> str:
     """Return the absolute path of ffmpeg/ffprobe or exit with install steps."""
     path = ffmpeg_exe(name)[0] if name in ("ffmpeg", "ffprobe") else safe_which(name)
+    if path and name in ("ffmpeg", "ffprobe"):
+        # 3.0.0 removed FFmpeg 5.x (deprecated in 2.14.0) and the workarounds that kept it running:
+        # an older build that reports its version is refused before it can fail some other way.
+        # (0, 0) is an unreadable version and is not refused; a git/vendor build gives only the
+        # libavutil major, which cannot tell 6.0 from 6.1, so it is refused only below 6. The
+        # version is ffprobe's (ffmpeg is never run for it: --dry-run promises no ffmpeg run);
+        # both ship from one build, and doctor reads each binary's own.
+        found = ffmpeg_version()
+        if found != (0, 0) and (found[0] < MIN_FFMPEG[0] or (_FFMPEG_VERSION_IS_RELEASE and found < MIN_FFMPEG)):
+            system = platform.system()
+            hint = INSTALL_HINTS.get(system, "  See https://ffmpeg.org/download.html")
+            refuse("missing_tool", "ffmpeg_unsupported",
+                   f"FFmpeg {found[0]}.{found[1]} (read from ffprobe -version) is not supported since ffmpeg-skill 3.0.0 (5.x was deprecated in "
+                   f"2.14.0): use FFmpeg 6.1+. Install it for {system}:\n{hint}",
+                   code=127, version=f"{found[0]}.{found[1]}", required="6.1")
     if path:
         return path
     system = platform.system()
@@ -281,6 +298,9 @@ def require_tool(name: str) -> str:
         code=127, kind="missing_tool",
     )
     return ""  # unreachable
+
+
+MIN_FFMPEG = (6, 1)   # requirements.ffmpeg since 3.0.0 (_contract.MIN_FFMPEG is the same floor)
 
 
 X264_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo")

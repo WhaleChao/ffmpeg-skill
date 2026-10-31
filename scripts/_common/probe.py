@@ -135,6 +135,34 @@ def verify_output(path: str) -> Dict[str, Any]:
     return meta
 
 
+_TIMECODE = re.compile(r"^(\d{2}):([0-5]\d):([0-5]\d)([:;.])(\d{2,3})$")
+
+
+def _tag(entry: Dict[str, Any], key: str) -> Optional[str]:
+    return next((v for k, v in (entry.get("tags") or {}).items() if k.lower() == key), None)
+
+
+def start_timecode(streams: List[Dict[str, Any]], fmt: Dict[str, Any],
+                   video: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The first well-formed `timecode` tag, from the video stream, then a `tmcd` data stream,
+    then the container: {value, drop_frame, source}. `drop_frame` is the `;` (or `.`) separator
+    before the frames field; `source` is `stream:<ffprobe index>` or `format`. None when no
+    source carries one (all three null). A tag that is not HH:MM:SS[:;.]FF is skipped, not
+    repaired."""
+    candidates = []
+    if video is not None:
+        candidates.append((video, f"stream:{video.get('index')}"))
+    candidates += [(s, f"stream:{s.get('index')}") for s in streams
+                   if s.get("codec_type") == "data" and str(s.get("codec_tag_string", "")).lower() == "tmcd"]
+    candidates.append((fmt, "format"))
+    for entry, source in candidates:
+        value = _tag(entry, "timecode")
+        m = _TIMECODE.match(value.strip()) if isinstance(value, str) else None
+        if m:
+            return {"value": value.strip(), "drop_frame": m.group(4) in ";.", "source": source}
+    return {"value": None, "drop_frame": None, "source": None}
+
+
 def probe(path: str, role: str = "input") -> Dict[str, Any]:
     """Return a compact, script-friendly description of a media file.
 
@@ -230,6 +258,8 @@ def probe(path: str, role: str = "input") -> Dict[str, Any]:
             "title": (ch.get("tags") or {}).get("title"),
         } for n, ch in enumerate(raw.get("chapters") or [])],
         "tags": {k.lower(): v for k, v in (fmt.get("tags") or {}).items() if k.lower() in ("title", "artist", "album", "comment", "date", "genre")},
+        # the source's start timecode (a camera's 10:00:00:00), for an edit list or an NLE relink
+        "timecode": start_timecode(streams, fmt, video),
         # every subtitle stream in file order: index n here is `-map 0:s:n`
         "subtitle_stream_details": [{
             "index": n,
@@ -434,7 +464,7 @@ def measure_frame_timing(path: str, duration: Optional[float], start: float = 0.
     time_base = None
     for i, t in enumerate(timing_window_starts(duration or 0.0, start)):
         proc = run([ffprobe, "-v", "error", "-select_streams", "V:0", "-show_packets",
-                    "-show_entries", "packet=pts,dts:stream=time_base", "-of", "json",
+                    "-show_entries", "packet=pts,dts,flags:stream=time_base", "-of", "json",
                     "-read_intervals", f"{t if i else ''}%{t + TIMING_WINDOW_SECONDS:.3f}", path], quiet=True, check=False)
         try:
             doc = json.loads(proc.stdout) if proc.returncode == 0 else None
@@ -444,8 +474,16 @@ def measure_frame_timing(path: str, duration: Optional[float], start: float = 0.
             return {"measured": "inconclusive", "windows": len(windows), "deltas": 0}
         time_base = time_base or ((doc.get("streams") or [{}])[0] or {}).get("time_base")
         tick = float(_fraction(str(time_base)) or 0) if time_base else 0.0
-        windows.append([p for p in complete_pts(doc.get("packets") or [])
-                        if isinstance(p, int) and p * tick >= t - 1e-6])
+        packets = doc.get("packets") or []
+        floor = t - 1e-6
+        if i:
+            # a seek into MPEG-TS lands mid-GOP, not on a keyframe: a frame stored before the
+            # landing point is missing, which read as a dropped frame (a constant TS measured
+            # `vfr`). Judge a seeked window from its first keyframe's presentation on.
+            key = next((p.get("pts") for p in packets if "K" in str(p.get("flags", "")) and isinstance(p.get("pts"), int)), None)
+            if key is not None:
+                floor = max(floor, key * tick - 1e-6)
+        windows.append([p for p in complete_pts(packets) if isinstance(p, int) and p * tick >= floor])
     return classify_frame_timing(windows, time_base)
 
 

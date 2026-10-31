@@ -345,6 +345,45 @@ def _video_packets(path: str, limit: "Optional[int]" = None) -> "List[str]":
     return (proc.stdout or "").split() if proc.returncode == 0 else []
 
 
+SPAN_HEAD_PACKETS = 64     # enough to see the earliest presentation time past B-frame reordering
+SPAN_TAIL_SECONDS = 10.0   # read from this far before the end, so a seek that lands early still reaches it
+
+
+def _stream_span(path: str, kind: str, duration: float = 0.0, start: float = 0.0) -> "Optional[Tuple[float, float]]":
+    """First packet's time and last packet's time plus its duration for the first `kind` stream
+    (V or a): measured, because Matroska/WebM state no stream length and MPEG-TS only an estimate.
+    None when the packets cannot be read or one has no time: a partial span would invent a gap."""
+    # JSON, not csv: older ffprobe builds (5.1) print side-data rows between the packet rows in csv.
+    # A long clip is read at its head and its tail only: every packet of a two-hour file is
+    # hundreds of thousands of entries for two numbers
+    cmd = [require_tool("ffprobe"), "-v", "error", "-select_streams", f"{kind}:0", "-show_entries",
+           "packet=pts_time,dts_time,duration_time", "-of", "json"]
+    if duration > 3 * SPAN_TAIL_SECONDS:
+        # read_intervals takes timestamps, so the tail starts from the file's own start time
+        # (an MPEG-TS clock can start hours in; an edit list can start it below zero)
+        cmd += ["-read_intervals", f"%+#{SPAN_HEAD_PACKETS},{start + duration - SPAN_TAIL_SECONDS:.3f}%"]
+    proc = run(cmd + [path], quiet=True, check=False)
+    try:
+        packets = json.loads(proc.stdout or "{}").get("packets") or [] if proc.returncode == 0 else []
+    except ValueError:
+        return None
+    times = []
+    for pkt in packets:
+        try:
+            # a packet ffprobe gives no pts (some muxers leave it on B-frames) still has its dts
+            t = float(pkt.get("pts_time", pkt.get("dts_time")))
+        except (TypeError, ValueError):
+            return None
+        try:
+            d = float(pkt.get("duration_time") or 0.0)
+        except (TypeError, ValueError):
+            d = 0.0
+        times.append((t, t + d))
+    if not times:
+        return None
+    return min(t for t, _ in times), max(e for _, e in times)
+
+
 def join_copy(args, metas: List[Dict[str, Any]]) -> int:
     """--copy: the concat demuxer with -c copy, after checking that the clips can be joined that
     way, and measured afterwards (video packet count and length against the clips')."""
@@ -354,6 +393,11 @@ def join_copy(args, metas: List[Dict[str, Any]]) -> int:
         die("--copy keeps every clip's own frame and rate: --width, --height and --fps need a re-encode, so drop --copy")
     if args.sample_rate or args.channels:
         die("--copy keeps every clip's own sound: --sample-rate and --channels need a re-encode, so drop --copy")
+    encoder = [f for f, on in (("--codec", STATE.codec), ("--hw", STATE.hw and STATE.hw_source == "flag"),
+                               ("--quality", getattr(args, "quality_given", False)))
+               if on]
+    if encoder:
+        die(f"--copy keeps every clip's own encoding: {', '.join(encoder)} choose(s) an encode, so drop --copy")
     output = args.output or default_output(args.inputs[0], "joined", os.path.splitext(args.inputs[0])[1].lstrip(".") or "mp4")
     guard_sidecar(output, *args.inputs)
     ext = os.path.splitext(output)[1].lower()
@@ -391,15 +435,19 @@ def join_copy(args, metas: List[Dict[str, Any]]) -> int:
                    hint="drop --copy, or re-cut those clips with cut.py --accurate", clips=[{"path": p, "differs": {"edit_list": True}} for p in hidden])
         gaps = []
         for p, m in zip(args.inputs, metas):
-            # each stream's start, and its end (start plus length) where the container states one;
-            # Matroska/WebM give no stream length, but the starts still have to agree
-            vs, as_ = m.get("video") or {}, m.get("audio") or {}
-            if not (vs and as_):
+            # each stream's span from its packets: Matroska/WebM state no stream length and an
+            # MPEG-TS stream length is an estimate, so a stated duration missed or invented gaps
+            if not (m.get("video") and m.get("audio")):
                 continue
-            vb, ab = float(vs.get("start_time") or 0.0), float(as_.get("start_time") or 0.0)
-            vd, ad = vs.get("duration"), as_.get("duration")
-            ve, ae = (vb + vd if vd else None), (ab + ad if ad else None)
-            if abs(vb - ab) > COPY_AV_GAP or (ve is not None and ae is not None and abs(ve - ae) > COPY_AV_GAP):
+            length, origin = float(m.get("duration") or 0.0), float(m.get("start_time") or 0.0)
+            v_span, a_span = _stream_span(p, "V", length, origin), _stream_span(p, "a", length, origin)
+            if v_span is None or a_span is None:
+                refuse("input", "join_copy_mismatch",
+                       f"--copy: could not measure where picture and sound start and end in {p} (a packet without a "
+                       "time), so a gap at the join could not be ruled out", hint="drop --copy to re-encode the join",
+                       clips=[{"path": p, "differs": {"av_span": "unmeasured"}}])
+            (vb, ve), (ab, ae) = v_span, a_span
+            if abs(vb - ab) > COPY_AV_GAP or abs(ve - ae) > COPY_AV_GAP:
                 gaps.append({"path": p, "video": [round(vb, 3), None if ve is None else round(ve, 3)],
                              "audio": [round(ab, 3), None if ae is None else round(ae, 3)]})
         if gaps:
@@ -452,7 +500,8 @@ def join_copy(args, metas: List[Dict[str, Any]]) -> int:
     info(f"wrote {output} ({fmt_secs(r.get('duration'))}, {n} clips, stream copy)")
     emit(output, mode="copy", **reported(), clips=n, transition="none", reencoded=False,
          verification=verification, expect_streams={"video": 1, "audio": 1 if all(m.get("audio") for m in metas) else 0},
-         stream_reference=metas)
+         stream_reference=metas,
+         dropped_non_av_streams=any(m.get("subtitle_streams") or m.get("data_streams") for m in metas))
     return 0
 
 
@@ -492,6 +541,8 @@ def main() -> int:
     aud.add_argument("--channels", type=int, choices=[1, 2, 6, 8], help="output channel count (default: the widest clip)")
     add_common(ap)
     args = ap.parse_args()
+    # given at all, not only different from the default: --quality 18 asks for an encode as much as 23 does
+    args.quality_given = any(a == "--quality" or a.startswith("--quality=") for a in sys.argv[1:])
     apply_common(args)
     if args.fps is not None and args.fps <= 0:
         die(f"--fps must be positive, got {args.fps:g}")

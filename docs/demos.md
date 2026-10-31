@@ -1,8 +1,9 @@
 # Demo gallery
 
-Every clip on this page was generated from nothing: ffmpeg's own synthetic sources make the
-footage, and each "after" is produced by running one of this repo's scripts on it. Rebuild the
-whole page's material with:
+Every clip on this page but two was generated from nothing: ffmpeg's own synthetic sources make
+the footage. The two exceptions, `reframe_talk` and `filler_en`, use AI-generated footage of
+people who do not exist (`demos/footage/`). Each "after" is produced by running one of this
+repo's scripts on its source. Rebuild the whole page's material with:
 
 ```bash
 python3 demos/build.py            # or: npm run demo
@@ -189,6 +190,16 @@ python3 scripts/fit.py demos/out/fixtures/mandel.mp4 --aspect 9:16 --fit crop --
 ```
 
 **Look for:** The vertical frame is cut out of the centre of the wide one -- full height, sides lost.
+
+### A talking head made vertical (AI-generated footage)
+
+![A talking head made vertical (AI-generated footage)](demos/reframe_talk.gif)
+
+```bash
+python3 scripts/fit.py demos/footage/ai_talk.mp4 --aspect 9:16 --fit crop --crop-x 0.27 --width 540 --preset veryfast -o demos/out/reframe_talk_after.mp4
+```
+
+**Look for:** The 9:16 frame is placed on the speaker with --crop-x 0.27 instead of the centre, where it would cut her face in half. The source is AI-generated footage, not a real person.
 
 ### 16:9 to 9:16 by padding
 
@@ -543,6 +554,16 @@ python3 scripts/multicam.py demos/out/fixtures/motion.mp4 demos/out/fixtures/cam
 
 
 ## Audio
+
+### Filler words cut from real speech (AI-generated footage)
+
+![Filler words cut from real speech (AI-generated footage)](demos/filler_en.gif)
+
+```bash
+python3 scripts/silence.py demos/out/filler_en_talk.mp4 --filler --words demos/footage/ai_talk_en.words.json --margin 0 --preset veryfast -o demos/out/filler_en_after.mp4
+```
+
+**Look for:** "Hey, er, hello there. Well, um, good morning." Right is silence.py --filler: the er and the um are gone and the sentence plays straight through. The source is AI-generated footage, not a real person.
 
 ### Silence removal
 

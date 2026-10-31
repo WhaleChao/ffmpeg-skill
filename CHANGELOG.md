@@ -10,6 +10,18 @@
   Velisa design, English and Japanese) instead of a copy of the README. The README moved to
   `readme.html`; the other pages are unchanged. `build_pages.py` copies `site/` to the site root
   and fails on a relative link in it that points nowhere, as it already did for the Markdown.
+- Two demos from AI-generated footage: `reframe_talk` (a speaker kept in a 9:16 crop with
+  `--crop-x`) and `filler_en` (two hesitations cut from English speech). The README and the demo
+  gallery show GIFs; the landing page plays both as MP4 with sound (`site/media/`), built by
+  `demos/pages_videos.py` with the skill's own grid.py, graphics.py, join.py and look.py.
+
+### Fixed
+
+- `silence.py --filler --transcribe` found no filler words on clean speech with a Whisper engine:
+  Whisper writes tidy text and leaves "uh"/"um" out unless its context shows them. The filler list
+  of the language asked for (English under auto) is now passed as the initial prompt (whisper.cpp
+  `--prompt`, faster-whisper `initial_prompt`, openai-whisper `--initial_prompt`). On the new demo
+  clip, faster-whisper base found neither hesitation without it and both with it.
 
 ## 3.1.0
 
